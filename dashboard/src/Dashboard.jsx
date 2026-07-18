@@ -6,6 +6,10 @@ import {
   BrowserProvider, Contract, keccak256, id,
   parseEther, ZeroHash, isAddress, toUtf8Bytes,
 } from "ethers";
+import {
+  isMobile, getInjectedProvider, openInMetaMask, openInCoinbaseWallet,
+  requestAccounts, ensureChain,
+} from "./wallet.js";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const env = (typeof import.meta !== "undefined" && import.meta.env) ? import.meta.env : {};
@@ -151,6 +155,14 @@ function useGas() {
   return gas;
 }
 
+const CHAIN_PARAMS = {
+  chainId: TARGET_CHAIN_HEX,
+  chainName: NETWORK_NAME,
+  nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+  rpcUrls: [RPC_FALLBACK],
+  blockExplorerUrls: [EXPLORER],
+};
+
 function useWallet() {
   const [account, setAccount] = useState(null);
   const [chainId, setChainId] = useState(null);
@@ -158,26 +170,49 @@ function useWallet() {
   const [connecting, setConn] = useState(false);
   const [error, setError] = useState(null);
   const [isAuditor, setIsAuditor] = useState(false);
+  const [needsWalletApp, setNeedsWalletApp] = useState(false);
+  const providerRef = useRef(null);
+
+  const getProvider = () => {
+    const p = getInjectedProvider();
+    providerRef.current = p;
+    return p;
+  };
 
   useEffect(() => {
-    if (!window.ethereum) return;
-    window.ethereum.request({ method: "eth_accounts" }).then((a) => { if (a[0]) setAccount(a[0]); });
-    window.ethereum.on("accountsChanged", (a) => setAccount(a[0] ?? null));
-    window.ethereum.on("chainChanged", (c) => setChainId(parseInt(c, 16)));
+    const eth = getProvider();
+    if (!eth) {
+      setNeedsWalletApp(isMobile());
+      return;
+    }
+    setNeedsWalletApp(false);
+    eth.request({ method: "eth_accounts" }).then((a) => { if (a[0]) setAccount(a[0]); }).catch(() => {});
+    const onAcc = (a) => setAccount(a?.[0] ?? null);
+    const onChain = (c) => setChainId(parseInt(c, 16));
+    eth.on?.("accountsChanged", onAcc);
+    eth.on?.("chainChanged", onChain);
+    // EIP-6963: re-check when providers announce
+    const onAnnounce = () => getProvider();
+    window.addEventListener?.("eip6963:announceProvider", onAnnounce);
+    return () => {
+      eth.removeListener?.("accountsChanged", onAcc);
+      eth.removeListener?.("chainChanged", onChain);
+      window.removeEventListener?.("eip6963:announceProvider", onAnnounce);
+    };
   }, []);
 
   useEffect(() => {
-    if (!account || !window.ethereum) return;
-    window.ethereum.request({ method: "eth_getBalance", params: [account, "latest"] })
+    const eth = getProvider();
+    if (!account || !eth) return;
+    eth.request({ method: "eth_getBalance", params: [account, "latest"] })
       .then((b) => setBalance((parseInt(b, 16) / 1e18).toFixed(4))).catch(() => {});
-    window.ethereum.request({ method: "eth_chainId" })
+    eth.request({ method: "eth_chainId" })
       .then((c) => setChainId(parseInt(c, 16))).catch(() => {});
 
-    // Check auditor role
     (async () => {
       try {
         if (!REGISTRY_ADDRESS) return;
-        const provider = new BrowserProvider(window.ethereum);
+        const provider = new BrowserProvider(eth);
         const c = new Contract(REGISTRY_ADDRESS, REGISTRY_ABI, provider);
         setIsAuditor(await c.hasRole(AUDITOR_ROLE, account));
       } catch { setIsAuditor(false); }
@@ -185,39 +220,44 @@ function useWallet() {
   }, [account]);
 
   const switchNetwork = async () => {
-    try {
-      await window.ethereum.request({
-        method: "wallet_switchEthereumChain",
-        params: [{ chainId: TARGET_CHAIN_HEX }],
-      });
-    } catch (switchErr) {
-      if (switchErr.code === 4902) {
-        await window.ethereum.request({
-          method: "wallet_addEthereumChain",
-          params: [{
-            chainId: TARGET_CHAIN_HEX,
-            chainName: NETWORK_NAME,
-            nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
-            rpcUrls: [RPC_FALLBACK],
-            blockExplorerUrls: [EXPLORER],
-          }],
-        });
-      } else throw switchErr;
-    }
+    const eth = getProvider();
+    if (!eth) throw new Error("No wallet provider");
+    await ensureChain(eth, TARGET_CHAIN_HEX, CHAIN_PARAMS);
+    const c = await eth.request({ method: "eth_chainId" });
+    setChainId(parseInt(c, 16));
   };
 
   const connect = async () => {
-    if (!window.ethereum) {
-      setError("MetaMask not installed — get it at metamask.io");
+    setError(null);
+    const eth = getProvider();
+
+    // Mobile browser without injected wallet → deep link into MetaMask
+    if (!eth) {
+      if (isMobile()) {
+        setNeedsWalletApp(true);
+        setError("Opening MetaMask… If nothing happens, install MetaMask and reopen this link inside the app.");
+        openInMetaMask();
+        return;
+      }
+      setError("No wallet found. Install MetaMask (desktop) or open this site inside MetaMask mobile.");
       return;
     }
-    setConn(true); setError(null);
+
+    setConn(true);
     try {
-      const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+      const accounts = await requestAccounts(eth);
+      if (!accounts?.[0]) throw new Error("No account returned");
       setAccount(accounts[0]);
-      await switchNetwork();
+      try {
+        await switchNetwork();
+      } catch (ne) {
+        // still connected; user can switch later
+        console.warn("chain switch:", ne);
+      }
     } catch (e) {
-      setError(e.message ?? "Connection failed");
+      const msg = e?.message || String(e);
+      if (e?.code === 4001) setError("Connection rejected");
+      else setError(msg);
     } finally {
       setConn(false);
     }
@@ -225,9 +265,13 @@ function useWallet() {
 
   return {
     account, chainId, balance, connecting, error, connect,
-    disconnect: () => setAccount(null),
+    disconnect: () => { setAccount(null); setError(null); },
     isBaseNetwork: chainId === TARGET_CHAIN_ID,
-    switchNetwork, isAuditor,
+    switchNetwork, isAuditor, needsWalletApp,
+    openMetaMask: openInMetaMask,
+    openCoinbase: openInCoinbaseWallet,
+    isMobile: isMobile(),
+    getEthereum: getProvider,
   };
 }
 
@@ -317,8 +361,51 @@ const CSS = `
     border-color:rgba(129,140,248,0.5)!important;
     box-shadow:0 0 0 3px rgba(99,102,241,0.15)!important;
   }
-  input[type=range]{-webkit-appearance:none;height:4px;border-radius:2px;background:rgba(255,255,255,0.12);}
-  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#a855f7);cursor:pointer;box-shadow:0 0 10px rgba(99,102,241,.5);}
+  input[type=range]{-webkit-appearance:none;height:4px;border-radius:2px;background:rgba(255,255,255,0.12);width:100%;}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:18px;height:18px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#a855f7);cursor:pointer;box-shadow:0 0 10px rgba(99,102,241,.5);}
+  button,a,.btn-primary,.btn-ghost{-webkit-tap-highlight-color:transparent;}
+  .hide-mobile{display:flex;}
+  .show-mobile{display:none!important;}
+  .nav-tabs-desktop{display:flex;}
+  .grid-stats{display:flex;gap:12px;flex-wrap:wrap;}
+  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+  .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;}
+  .grid-4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;}
+  .rails-grid{display:grid;grid-template-columns:1.1fr 0.9fr;gap:16px;}
+  .page-pad{padding:24px 20px 48px;max-width:1440px;margin:0 auto;}
+  .nav-bar{padding:0 16px;height:60px;gap:10px;}
+  .drawer-backdrop{position:fixed;inset:0;background:rgba(0,0,0,0.55);z-index:200;backdrop-filter:blur(4px);}
+  .drawer{
+    position:fixed;top:0;right:0;bottom:0;width:min(320px,88vw);z-index:210;
+    background:linear-gradient(180deg,#0c0e1a,#080a12);border-left:1px solid rgba(255,255,255,0.08);
+    padding:20px 16px;display:flex;flex-direction:column;gap:8px;
+    box-shadow:-12px 0 40px rgba(0,0,0,0.5);
+  }
+  .drawer button.tab{
+    text-align:left;padding:14px 14px;border-radius:12px;border:none;font-size:14px;font-weight:600;
+    background:transparent;color:#94a3b8;cursor:pointer;width:100%;
+  }
+  .drawer button.tab.active{background:rgba(99,102,241,0.18);color:#c4b5fd;}
+  @media (max-width:900px){
+    .hide-mobile{display:none!important;}
+    .show-mobile{display:flex!important;}
+    .nav-tabs-desktop{display:none!important;}
+    .grid-2,.rails-grid,.grid-3,.grid-4{grid-template-columns:1fr!important;}
+    .page-pad{padding:16px 12px 100px;}
+    .nav-bar{padding:0 12px;height:56px;}
+    .stat-card-title{font-size:10px!important;}
+    .hero-title{font-size:22px!important;}
+    .agent-side{display:none!important;}
+    .agent-side.open-mobile{
+      display:block!important;position:fixed;inset:0;z-index:180;width:100%!important;
+      height:100%!important;top:0!important;border-radius:0!important;
+      background:#080a12!important;
+    }
+  }
+  @media (max-width:480px){
+    .grid-stats{flex-direction:column;}
+    .grid-stats > *{min-width:100%!important;}
+  }
 `;
 
 // ─── UI atoms ─────────────────────────────────────────────────────────────────
@@ -345,16 +432,16 @@ function Badge({ label, color }) {
 function StatCard({ label, value, sub, color = "#10b981", loading }) {
   return (
     <div className="glass glass-hover" style={{
-      borderRadius: 16, padding: "18px 20px", flex: 1, minWidth: 140, position: "relative", overflow: "hidden",
+      borderRadius: 16, padding: "16px 16px", flex: 1, minWidth: 130, position: "relative", overflow: "hidden",
     }}>
       <div style={{
         position: "absolute", top: -20, right: -20, width: 80, height: 80, borderRadius: "50%",
         background: `radial-gradient(circle, ${color}22, transparent 70%)`, pointerEvents: "none",
       }} />
-      <div style={{ fontSize: 11, color: "#64748b", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 8, fontWeight: 500 }}>{label}</div>
+      <div className="stat-card-title" style={{ fontSize: 11, color: "#64748b", letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 8, fontWeight: 500 }}>{label}</div>
       {loading ? <Spinner /> : (
         <>
-          <div style={{ fontSize: 24, fontWeight: 700, color, fontFamily: "'Space Grotesk',sans-serif", lineHeight: 1.1, letterSpacing: "-0.02em" }}>{value}</div>
+          <div style={{ fontSize: 22, fontWeight: 700, color, fontFamily: "'Space Grotesk',sans-serif", lineHeight: 1.1, letterSpacing: "-0.02em" }}>{value}</div>
           {sub && <div style={{ fontSize: 11, color: "#64748b", marginTop: 6 }}>{sub}</div>}
         </>
       )}
@@ -429,10 +516,11 @@ function AgentDetail({ agentId, wallet, onAudited }) {
   }, [agentId]);
 
   const submitAudit = async (passed = true) => {
-    if (!window.ethereum || !REGISTRY_ADDRESS || !wallet.account) return;
+    const eth = getInjectedProvider();
+    if (!eth || !REGISTRY_ADDRESS || !wallet.account) return;
     setAuditing(true); setAuditMsg(null);
     try {
-      const provider = new BrowserProvider(window.ethereum);
+      const provider = new BrowserProvider(eth);
       const signer = await provider.getSigner();
       const c = new Contract(REGISTRY_ADDRESS, REGISTRY_ABI, signer);
       const tx = await c.submitAudit(agentId, passed ? 85 : 30, ZeroHash, [], passed);
@@ -626,7 +714,7 @@ function RailsLab({ agents }) {
         ))}
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1.1fr 0.9fr", gap: 16 }}>
+      <div className="rails-grid">
         <div className="glass" style={{ borderRadius: 18, padding: 22 }}>
           <div style={{ fontSize: 12, fontWeight: 600, color: "#94a3b8", marginBottom: 16, letterSpacing: "0.06em", textTransform: "uppercase" }}>
             Intent
@@ -781,7 +869,7 @@ function RailsLab({ agents }) {
         </div>
       </div>
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12 }}>
+      <div className="grid-3">
         {[
           { t: "Identity first", d: "No anonymous capital. Every intent maps to an agent ID and owner." },
           { t: "Rails before alpha", d: "Yield is optional. Blow-up protection is not. Limits are on-chain." },
@@ -810,8 +898,11 @@ function RegisterModal({ wallet, onClose, onSuccess }) {
   const STEPS = ["Identity", "Safety Rails", "Capabilities", "Confirm"];
 
   async function deploy() {
-    if (!window.ethereum || !REGISTRY_ADDRESS) {
-      setError("MetaMask or registry address missing");
+    const eth = getInjectedProvider();
+    if (!eth || !REGISTRY_ADDRESS) {
+      setError(isMobile()
+        ? "Open this site inside MetaMask app, then try again"
+        : "Wallet or registry address missing");
       return;
     }
     if (!wallet.isBaseNetwork) {
@@ -820,7 +911,7 @@ function RegisterModal({ wallet, onClose, onSuccess }) {
     }
     setSub(true); setError(null);
     try {
-      const provider = new BrowserProvider(window.ethereum);
+      const provider = new BrowserProvider(eth);
       const signer = await provider.getSigner();
       const registry = new Contract(REGISTRY_ADDRESS, REGISTRY_ABI, signer);
       const fee = await registry.registrationFee();
@@ -866,7 +957,7 @@ function RegisterModal({ wallet, onClose, onSuccess }) {
       display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 16,
     }} onClick={(e) => e.target === e.currentTarget && onClose()}>
       <div className="glass" style={{
-        borderRadius: 20, width: 520, maxHeight: "90vh", overflow: "hidden",
+        borderRadius: 20, width: "min(520px, 100%)", maxHeight: "92vh", overflow: "hidden",
         display: "flex", flexDirection: "column", animation: "glow 4s ease-in-out infinite",
       }}>
         <div style={{ padding: "22px 24px 16px", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
@@ -1047,6 +1138,8 @@ export default function Dashboard() {
   const [showRegister, setRegister] = useState(false);
   const [filterStatus, setFStatus] = useState("all");
   const [search, setSearch] = useState("");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [walletSheet, setWalletSheet] = useState(false);
   const eventRef = useRef(null);
   const [liveAgents, setLiveAgents] = useState([]);
 
@@ -1109,18 +1202,20 @@ export default function Dashboard() {
     { name: "AgentExecutor", address: EXECUTOR_ADDRESS, desc: "Tx gating & execution" },
   ];
 
+  const goTab = (id) => { setTab(id); setMenuOpen(false); };
+
   return (
     <div className="mesh-bg" style={{ minHeight: "100vh", color: "#f1f5f9", fontFamily: "'Inter',system-ui,sans-serif" }}>
       <style>{CSS}</style>
 
       {/* Nav */}
-      <div style={{
+      <div className="nav-bar" style={{
         position: "sticky", top: 0, zIndex: 100,
-        background: "rgba(5,6,15,0.75)", backdropFilter: "blur(20px)",
+        background: "rgba(5,6,15,0.88)", backdropFilter: "blur(20px)",
         borderBottom: "1px solid rgba(255,255,255,0.06)",
-        padding: "0 20px", display: "flex", alignItems: "center", height: 60, gap: 14,
+        display: "flex", alignItems: "center",
       }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginRight: 12, flexShrink: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
           <div style={{
             width: 34, height: 34, borderRadius: 10,
             background: "linear-gradient(135deg,#6366f1,#a855f7)",
@@ -1130,29 +1225,28 @@ export default function Dashboard() {
           }}>⬡</div>
           <div>
             <div style={{ fontSize: 14, fontWeight: 800, letterSpacing: "-0.02em" }} className="shine-text">AgentForge</div>
-            <div style={{ fontSize: 9, color: "#64748b", letterSpacing: "0.12em", textTransform: "uppercase" }}>
-              {NETWORK_NAME} · Testnet
+            <div style={{ fontSize: 9, color: "#64748b", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+              {NETWORK_NAME}
             </div>
           </div>
         </div>
 
-        <div style={{ display: "flex", gap: 2, flex: 1, overflowX: "auto" }}>
+        <div className="nav-tabs-desktop" style={{ gap: 2, flex: 1, overflowX: "auto", marginLeft: 12 }}>
           {tabs.map((t) => (
-            <button key={t.id} onClick={() => setTab(t.id)} style={{
+            <button key={t.id} onClick={() => goTab(t.id)} style={{
               padding: "7px 12px", borderRadius: 8, border: "none",
               background: activeTab === t.id ? "rgba(99,102,241,0.2)" : "transparent",
               color: activeTab === t.id ? "#c4b5fd" : "#64748b",
               fontSize: 12, cursor: "pointer", whiteSpace: "nowrap",
               fontWeight: activeTab === t.id ? 600 : 400,
-              borderBottom: activeTab === t.id ? "2px solid #818cf8" : "2px solid transparent",
             }}>
               <span style={{ fontSize: 10, marginRight: 5, opacity: 0.8 }}>{t.icon}</span>{t.label}
             </button>
           ))}
         </div>
 
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
-          <div style={{
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0, marginLeft: "auto" }}>
+          <div className="hide-mobile" style={{
             display: "flex", gap: 6, alignItems: "center", padding: "5px 11px", borderRadius: 999,
             background: connected ? "rgba(16,185,129,0.1)" : "rgba(239,68,68,0.1)",
             border: `1px solid ${connected ? "rgba(16,185,129,0.3)" : "rgba(239,68,68,0.3)"}`,
@@ -1161,59 +1255,140 @@ export default function Dashboard() {
               width: 7, height: 7, borderRadius: "50%",
               background: connected ? "#10b981" : "#ef4444",
               animation: connected ? "pulse 2s infinite" : "none",
-              boxShadow: connected ? "0 0 8px #10b981" : "none",
             }} />
             <span style={{ fontSize: 11, color: connected ? "#34d399" : "#f87171", fontWeight: 600 }}>
               {connected ? "Live" : "Offline"}
             </span>
           </div>
 
-          {gas && (
-            <div className="glass" style={{ fontSize: 11, color: "#94a3b8", padding: "5px 10px", borderRadius: 8 }}>
-              ⛽ {Number(gas.gasPrice).toFixed(3)} gwei
-            </div>
-          )}
-
           {!wallet.account ? (
-            <button onClick={wallet.connect} disabled={wallet.connecting} className="btn-primary"
-              style={{ padding: "8px 16px", borderRadius: 10, fontSize: 12 }}>
-              {wallet.connecting ? "Connecting…" : "Connect Wallet"}
+            <button onClick={() => (wallet.isMobile && !wallet.getEthereum?.() ? setWalletSheet(true) : wallet.connect())}
+              disabled={wallet.connecting} className="btn-primary"
+              style={{ padding: "10px 14px", borderRadius: 10, fontSize: 13, minHeight: 40 }}>
+              {wallet.connecting ? "…" : "Connect"}
             </button>
           ) : (
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              {!wallet.isBaseNetwork && <Badge label="Wrong Network" color="#ef4444" />}
-              {wallet.isAuditor && <Badge label="Auditor" color="#a78bfa" />}
-              <div className="glass" style={{
-                padding: "6px 12px", borderRadius: 10, fontSize: 12, color: "#34d399", cursor: "pointer",
-              }} onClick={wallet.disconnect} title="Click to disconnect">
-                <span style={{
-                  display: "inline-block", width: 6, height: 6, borderRadius: "50%",
-                  background: "#10b981", marginRight: 6, boxShadow: "0 0 6px #10b981",
-                }} />
-                {fmtAddr(wallet.account)} · {wallet.balance} ETH
-              </div>
-            </div>
-          )}
-
-          {wallet.account && wallet.isBaseNetwork && (
-            <button onClick={() => setRegister(true)} className="btn-primary"
-              style={{ padding: "8px 14px", borderRadius: 10, fontSize: 12 }}>
-              + Register Agent
+            <button type="button" className="glass" style={{
+              padding: "8px 12px", borderRadius: 10, fontSize: 12, color: "#34d399",
+              border: "1px solid rgba(16,185,129,0.25)", cursor: "pointer", minHeight: 40,
+            }} onClick={() => setWalletSheet(true)}>
+              {fmtAddr(wallet.account)}
             </button>
           )}
+
+          <button type="button" className="show-mobile btn-ghost" aria-label="Menu"
+            onClick={() => setMenuOpen(true)}
+            style={{ width: 42, height: 42, borderRadius: 10, alignItems: "center", justifyContent: "center", fontSize: 20 }}>
+            ☰
+          </button>
         </div>
       </div>
+
+      {/* Mobile drawer */}
+      {menuOpen && (
+        <>
+          <div className="drawer-backdrop" onClick={() => setMenuOpen(false)} />
+          <div className="drawer">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <span style={{ fontWeight: 700, color: "#e2e8f0" }}>Menu</span>
+              <button type="button" className="btn-ghost" style={{ width: 36, height: 36, borderRadius: 8 }} onClick={() => setMenuOpen(false)}>✕</button>
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+              <Badge label={connected ? "API Live" : "API Offline"} color={connected ? "#10b981" : "#ef4444"} />
+              {gas && <Badge label={`${Number(gas.gasPrice).toFixed(3)} gwei`} color="#64748b" />}
+            </div>
+            {tabs.map((t) => (
+              <button key={t.id} type="button" className={`tab ${activeTab === t.id ? "active" : ""}`} onClick={() => goTab(t.id)}>
+                {t.icon}  {t.label}
+              </button>
+            ))}
+            {wallet.account && wallet.isBaseNetwork && (
+              <button type="button" className="btn-primary" style={{ marginTop: 12, padding: 14, borderRadius: 12, fontSize: 14 }}
+                onClick={() => { setMenuOpen(false); setRegister(true); }}>
+                + Register Agent
+              </button>
+            )}
+            <a href="https://github.com/brypto2001/agentforge-protocol/blob/main/docs/PUBLISH_CUSTOM_AGENT.md"
+              target="_blank" rel="noreferrer"
+              style={{ marginTop: "auto", fontSize: 12, color: "#818cf8", textDecoration: "none", padding: 12 }}>
+              Publish custom agent docs ↗
+            </a>
+          </div>
+        </>
+      )}
+
+      {/* Wallet sheet (mobile + desktop) */}
+      {walletSheet && (
+        <>
+          <div className="drawer-backdrop" onClick={() => setWalletSheet(false)} />
+          <div className="drawer" style={{ left: 0, right: 0, top: "auto", bottom: 0, width: "100%", maxWidth: "100%", borderRadius: "20px 20px 0 0", borderLeft: "none", borderTop: "1px solid rgba(255,255,255,0.1)", maxHeight: "70vh" }}>
+            <div style={{ width: 40, height: 4, borderRadius: 2, background: "rgba(255,255,255,0.15)", margin: "0 auto 16px" }} />
+            <div style={{ fontSize: 16, fontWeight: 700, color: "#f1f5f9", marginBottom: 8 }}>Wallet</div>
+            {!wallet.account ? (
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <p style={{ fontSize: 13, color: "#94a3b8", lineHeight: 1.5, margin: "0 0 8px" }}>
+                  {wallet.isMobile
+                    ? "On phone, open this site inside MetaMask (or Coinbase Wallet) for the best experience."
+                    : "Connect an injected wallet (MetaMask extension)."}
+                </p>
+                {wallet.getEthereum?.() ? (
+                  <button type="button" className="btn-primary" style={{ padding: 16, borderRadius: 14, fontSize: 15 }}
+                    onClick={async () => { await wallet.connect(); setWalletSheet(false); }}>
+                    Connect injected wallet
+                  </button>
+                ) : null}
+                <button type="button" className="btn-primary" style={{ padding: 16, borderRadius: 14, fontSize: 15 }}
+                  onClick={() => { wallet.openMetaMask(); }}>
+                  Open in MetaMask app
+                </button>
+                <button type="button" className="btn-ghost" style={{ padding: 14, borderRadius: 14, fontSize: 14 }}
+                  onClick={() => { wallet.openCoinbase(); }}>
+                  Open in Coinbase Wallet
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+                <div className="glass" style={{ padding: 14, borderRadius: 12, fontFamily: "monospace", fontSize: 13, wordBreak: "break-all" }}>
+                  {wallet.account}
+                </div>
+                <div style={{ fontSize: 13, color: "#94a3b8" }}>Balance: <b style={{ color: "#e2e8f0" }}>{wallet.balance} ETH</b></div>
+                {!wallet.isBaseNetwork && (
+                  <button type="button" className="btn-primary" style={{ padding: 14, borderRadius: 12 }}
+                    onClick={() => wallet.switchNetwork()}>
+                    Switch to {NETWORK_NAME}
+                  </button>
+                )}
+                {wallet.isBaseNetwork && (
+                  <button type="button" className="btn-primary" style={{ padding: 14, borderRadius: 12 }}
+                    onClick={() => { setWalletSheet(false); setRegister(true); }}>
+                    + Register Agent
+                  </button>
+                )}
+                <button type="button" className="btn-ghost" style={{ padding: 14, borderRadius: 12 }}
+                  onClick={() => { wallet.disconnect(); setWalletSheet(false); }}>
+                  Disconnect
+                </button>
+              </div>
+            )}
+            {wallet.error && (
+              <div style={{ marginTop: 12, fontSize: 12, color: "#fca5a5", lineHeight: 1.4 }}>{wallet.error}</div>
+            )}
+            <button type="button" className="btn-ghost" style={{ marginTop: 16, padding: 12, borderRadius: 10 }}
+              onClick={() => setWalletSheet(false)}>Close</button>
+          </div>
+        </>
+      )}
 
       {wallet.account && !wallet.isBaseNetwork && (
         <div style={{
           background: "linear-gradient(90deg,rgba(239,68,68,0.15),rgba(249,115,22,0.1))",
           borderBottom: "1px solid rgba(239,68,68,0.25)",
-          padding: "12px 20px", fontSize: 13, color: "#fca5a5",
+          padding: "12px 16px", fontSize: 13, color: "#fca5a5",
           display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap",
         }}>
-          <span>⚠ Wrong network — switch to <b>{NETWORK_NAME}</b> to use the protocol.</span>
-          <button onClick={wallet.switchNetwork} className="btn-primary" style={{ padding: "6px 14px", borderRadius: 8, fontSize: 12 }}>
-            Switch to {NETWORK_NAME}
+          <span>Wrong network — use <b>{NETWORK_NAME}</b></span>
+          <button onClick={wallet.switchNetwork} className="btn-primary" style={{ padding: "10px 14px", borderRadius: 8, fontSize: 12, minHeight: 40 }}>
+            Switch
           </button>
         </div>
       )}
@@ -1221,19 +1396,19 @@ export default function Dashboard() {
       {!connected && (
         <div style={{
           background: "rgba(239,68,68,0.08)", borderBottom: "1px solid rgba(239,68,68,0.15)",
-          padding: "10px 20px", fontSize: 12, color: "#f87171", textAlign: "center",
+          padding: "10px 14px", fontSize: 12, color: "#f87171", textAlign: "center", lineHeight: 1.4,
         }}>
-          Backend offline or waking up (Render free tier). Retry in ~30s —{" "}
-          <a href={`${API_URL}/health`} target="_blank" rel="noreferrer" style={{ color: "#fca5a5" }}>check /health</a>
+          Backend waking up (~30s on free tier).{" "}
+          <a href={`${API_URL}/health`} target="_blank" rel="noreferrer" style={{ color: "#fca5a5" }}>/health</a>
         </div>
       )}
 
-      <div style={{ padding: "24px 20px 48px", maxWidth: 1440, margin: "0 auto" }}>
+      <div className="page-pad">
         {/* OVERVIEW */}
         {activeTab === "overview" && (
           <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
             <div>
-              <h1 style={{ margin: 0, fontSize: 28, fontWeight: 800, letterSpacing: "-0.03em", fontFamily: "'Space Grotesk',sans-serif" }}>
+              <h1 className="hero-title" style={{ margin: 0, fontSize: 28, fontWeight: 800, letterSpacing: "-0.03em", fontFamily: "'Space Grotesk',sans-serif" }}>
                 Protocol <span className="shine-text">Command Center</span>
               </h1>
               <p style={{ margin: "8px 0 0", color: "#64748b", fontSize: 14 }}>
@@ -1241,7 +1416,7 @@ export default function Dashboard() {
               </p>
             </div>
 
-            <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+            <div className="grid-stats">
               <StatCard label="Total Agents" value={stats?.totalAgents ?? "—"} sub={`${stats?.activeAgents ?? 0} active`} color="#34d399" loading={statsLoad} />
               <StatCard label="Total Volume" value={stats ? fmtUSD(stats.totalVolumeUSD) : "—"} sub="all time" color="#818cf8" loading={statsLoad} />
               <StatCard label="Transactions" value={stats ? parseInt(stats.totalTransactions).toLocaleString() : "—"} sub={`${blockRate}% blocked`} color="#c4b5fd" loading={statsLoad} />
@@ -1286,7 +1461,7 @@ export default function Dashboard() {
               />
             )}
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+            <div className="grid-2">
               <div className="glass" style={{ borderRadius: 16, padding: 18 }}>
                 <div style={{ fontSize: 12, fontWeight: 600, color: "#94a3b8", marginBottom: 12 }}>Recent Audits</div>
                 {audits.slice(0, 6).map((a, i) => (
@@ -1357,10 +1532,14 @@ export default function Dashboard() {
               )}
             </div>
             {selected && (
-              <div className="glass" style={{
+              <div className={`glass agent-side ${selected ? "open-mobile" : ""}`} style={{
                 width: 360, flexShrink: 0, position: "sticky", top: 72,
                 height: "calc(100vh - 96px)", borderRadius: 16, overflow: "hidden",
               }}>
+                <div className="show-mobile" style={{ padding: "12px 14px", borderBottom: "1px solid rgba(255,255,255,0.06)", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontWeight: 600, fontSize: 14 }}>Agent</span>
+                  <button type="button" className="btn-ghost" style={{ padding: "8px 12px", borderRadius: 8 }} onClick={() => setSelected(null)}>Close</button>
+                </div>
                 <AgentDetail
                   agentId={selected}
                   wallet={wallet}

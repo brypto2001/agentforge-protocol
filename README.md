@@ -59,7 +59,21 @@ node scripts/setup.js
 | Arbitrage Bot | `npm run agent:arb` | Captures price gaps on Uniswap V3 |
 | Data Oracle | `npm run agent:oracle` | Publishes signed price bundles from Chainlink |
 
+## Publish a custom agent
+
+```bash
+# Register + check rails (AgentForge-compliant path)
+npm run agent:custom
+
+# Docs
+# docs/PUBLISH_CUSTOM_AGENT.md
+# docs/PROTOCOL.md
+```
+
+Use `sdk/agentforge-client.ts` — always route trades through `AgentExecutor.execute()`.
+
 ## Full Guide
 
 → Free deployment: `FREE_DEPLOY_GUIDE.md`  
-→ Live mainnet: `DEPLOY_LIVE.md`
+→ Live mainnet: `DEPLOY_LIVE.md`  
+→ Custom agents: `docs/PUBLISH_CUSTOM_AGENT.md`

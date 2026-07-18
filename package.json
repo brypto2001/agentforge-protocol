@@ -16,6 +16,7 @@
     "setup": "node scripts/setup.js",
     "server": "node server/server.js",
     "start": "node server/server.js",
+    "agent:custom": "ts-node --transpile-only sdk/examples/custom-agent.ts",
     "agent:yield": "AGENT_TYPE=yield ts-node sdk/agent-runner.ts",
     "agent:arb": "AGENT_TYPE=arbitrage ts-node sdk/agent-runner.ts",
     "agent:oracle": "AGENT_TYPE=oracle ts-node sdk/agent-runner.ts",
