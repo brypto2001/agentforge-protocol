@@ -63,6 +63,17 @@ db.exec(`
     key TEXT PRIMARY KEY,
     value TEXT
   );
+  CREATE TABLE IF NOT EXISTS listings (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT,
+    service_type INTEGER,
+    name TEXT,
+    description TEXT,
+    price_per_unit TEXT,
+    payment_token TEXT,
+    active INTEGER,
+    created_at INTEGER
+  );
   CREATE INDEX IF NOT EXISTS idx_tx_agent ON transactions(agent_id, timestamp);
   CREATE INDEX IF NOT EXISTS idx_tx_time ON transactions(timestamp);
 `);
@@ -72,15 +83,20 @@ try { db.exec("ALTER TABLE agents ADD COLUMN metadata_uri TEXT"); } catch {}
 try { db.exec("ALTER TABLE agents ADD COLUMN model_hash TEXT"); } catch {}
 try { db.exec("ALTER TABLE agents ADD COLUMN code_hash TEXT"); } catch {}
 
+try { db.exec("ALTER TABLE agents ADD COLUMN strategy TEXT"); } catch {}
+try { db.exec("ALTER TABLE agents ADD COLUMN strategy_manifest TEXT"); } catch {}
+
 const upsertAgent = db.prepare(`
   INSERT INTO agents (
     id, owner, name, status, safety_level, audit_score, reputation,
     total_tx_count, total_volume_usd, registered_at, last_audit_at,
-    kyc_verified, capabilities, chain, metadata_uri, model_hash, code_hash
+    kyc_verified, capabilities, chain, metadata_uri, model_hash, code_hash,
+    strategy, strategy_manifest
   ) VALUES (
     @id, @owner, @name, @status, @safety_level, @audit_score, @reputation,
     @total_tx_count, @total_volume_usd, @registered_at, @last_audit_at,
-    @kyc_verified, @capabilities, @chain, @metadata_uri, @model_hash, @code_hash
+    @kyc_verified, @capabilities, @chain, @metadata_uri, @model_hash, @code_hash,
+    @strategy, @strategy_manifest
   )
   ON CONFLICT(id) DO UPDATE SET
     owner=excluded.owner,
@@ -97,7 +113,17 @@ const upsertAgent = db.prepare(`
     capabilities=excluded.capabilities,
     metadata_uri=excluded.metadata_uri,
     model_hash=excluded.model_hash,
-    code_hash=excluded.code_hash
+    code_hash=excluded.code_hash,
+    strategy=excluded.strategy,
+    strategy_manifest=excluded.strategy_manifest
+`);
+
+const upsertListing = db.prepare(`
+  INSERT INTO listings (id, agent_id, service_type, name, description, price_per_unit, payment_token, active, created_at)
+  VALUES (@id, @agent_id, @service_type, @name, @description, @price_per_unit, @payment_token, @active, @created_at)
+  ON CONFLICT(id) DO UPDATE SET
+    name=excluded.name, description=excluded.description, active=excluded.active,
+    price_per_unit=excluded.price_per_unit
 `);
 
 // ─── Chain ────────────────────────────────────────────────────────────────────
@@ -122,10 +148,18 @@ const COMMERCE_ABI = [
   "event ListingCreated(bytes32 indexed listingId, bytes32 indexed agentId, uint8 serviceType)",
   "event OrderCreated(bytes32 indexed orderId, bytes32 indexed listingId, bytes32 indexed buyerAgentId)",
   "event OrderConfirmed(bytes32 indexed orderId)",
+  "function listings(bytes32) view returns (bytes32 agentId, uint8 serviceType, string name, string description, address paymentToken, uint256 pricePerUnit, uint256 unitSize, uint256 minUnits, uint256 maxUnits, uint256 totalEarned, uint256 totalOrders, bool active, uint256 createdAt, bytes32 slaHash)",
+  "function allListingIds(uint256) view returns (bytes32)",
+];
+
+const DEMO_MARKET_ABI = [
+  "function tradeCount() view returns (uint256)",
+  "event TradeExecuted(bytes32 indexed agentId, address indexed operator, uint256 amountUSD, string strategy, bool success)",
 ];
 
 let registry = null;
 let commerce = null;
+let demoMarket = null;
 let indexerRunning = false;
 let lastSyncAt = 0;
 let lastBlockSeen = 0;
@@ -134,6 +168,7 @@ let chainAgentCount = 0;
 function initContracts() {
   const regAddr = process.env.REGISTRY_ADDRESS;
   const comAddr = process.env.COMMERCE_ADDRESS;
+  const mktAddr = process.env.DEMO_MARKET_ADDRESS;
   if (regAddr && regAddr !== ZeroAddress) {
     registry = new Contract(regAddr, REGISTRY_ABI, provider);
     console.log("[Server] Registry:", regAddr);
@@ -142,13 +177,31 @@ function initContracts() {
     commerce = new Contract(comAddr, COMMERCE_ABI, provider);
     console.log("[Server] Commerce:", comAddr);
   }
+  if (mktAddr && mktAddr !== ZeroAddress) {
+    demoMarket = new Contract(mktAddr, DEMO_MARKET_ABI, provider);
+    console.log("[Server] DemoMarket:", mktAddr);
+  }
+}
+
+function parseStrategyManifest(uri) {
+  if (!uri || typeof uri !== "string") return null;
+  try {
+    if (uri.startsWith("data:application/json;base64,")) {
+      const b64 = uri.slice("data:application/json;base64,".length);
+      const json = Buffer.from(b64, "base64").toString("utf8");
+      return JSON.parse(json);
+    }
+    if (uri.startsWith("{")) return JSON.parse(uri);
+  } catch {}
+  return null;
 }
 
 function nameFromMetadata(uri, agentId) {
   if (!uri) return `Agent-${String(agentId).slice(2, 10)}`;
   try {
-    // ipfs://agentforge/Name%20Here or plain name
     const raw = String(uri);
+    const man = parseStrategyManifest(raw);
+    if (man?.name) return man.name;
     if (raw.includes("agentforge/")) {
       const part = raw.split("agentforge/").pop();
       return decodeURIComponent(part || "") || `Agent-${String(agentId).slice(2, 10)}`;
@@ -162,10 +215,11 @@ function nameFromMetadata(uri, agentId) {
 
 function agentRowFromChain(agentId, agent) {
   const id = String(agentId);
+  const man = parseStrategyManifest(agent.metadataURI);
   return {
     id,
     owner: agent.owner,
-    name: nameFromMetadata(agent.metadataURI, id),
+    name: man?.name || nameFromMetadata(agent.metadataURI, id),
     status: Number(agent.status),
     safety_level: Number(agent.safetyLevel),
     audit_score: Number(agent.auditScore),
@@ -175,11 +229,13 @@ function agentRowFromChain(agentId, agent) {
     registered_at: Number(agent.registeredAt) * 1000,
     last_audit_at: Number(agent.lastAuditAt) * 1000,
     kyc_verified: agent.kycVerified ? 1 : 0,
-    capabilities: JSON.stringify(agent.capabilities ?? []),
+    capabilities: JSON.stringify(agent.capabilities ?? man?.capabilities ?? []),
     chain: CHAIN_ID === 8453 ? "base" : "base-sepolia",
     metadata_uri: agent.metadataURI ?? "",
     model_hash: agent.modelHash ?? "",
-    code_hash: agent.codeHash ?? "",
+    code_hash: agent.codeHash ?? man?.codeHash ?? "",
+    strategy: man?.strategy || man?.name || null,
+    strategy_manifest: man ? JSON.stringify(man) : null,
   };
 }
 
@@ -193,6 +249,29 @@ async function pullAgent(agentId) {
   return row;
 }
 
+async function pullListing(listingId) {
+  if (!commerce) return null;
+  try {
+    const L = await commerce.listings(listingId);
+    const row = {
+      id: String(listingId),
+      agent_id: L.agentId,
+      service_type: Number(L.serviceType),
+      name: L.name,
+      description: L.description,
+      price_per_unit: L.pricePerUnit?.toString?.() ?? String(L.pricePerUnit),
+      payment_token: L.paymentToken,
+      active: L.active ? 1 : 0,
+      created_at: Number(L.createdAt) * 1000,
+    };
+    upsertListing.run(row);
+    return row;
+  } catch (e) {
+    console.warn("[Sync] listing", String(listingId).slice(0, 12), e.message);
+    return null;
+  }
+}
+
 async function bootstrapFromChain() {
   if (!registry) return;
   console.log("[Sync] Bootstrapping agents from chain…");
@@ -204,7 +283,6 @@ async function bootstrapFromChain() {
     try {
       ids = await registry.getAllAgentIds();
     } catch {
-      // fallback if array getter fails
       ids = [];
     }
     for (let i = 0; i < ids.length; i++) {
@@ -215,8 +293,24 @@ async function bootstrapFromChain() {
       }
       if (i % 5 === 0) await new Promise((r) => setTimeout(r, 50));
     }
+
+    // Commerce listings — walk until empty
+    if (commerce) {
+      console.log("[Sync] Bootstrapping marketplace listings…");
+      for (let i = 0; i < 200; i++) {
+        try {
+          const lid = await commerce.allListingIds(i);
+          if (!lid || lid === "0x" + "0".repeat(64)) break;
+          await pullListing(lid);
+        } catch {
+          break;
+        }
+        if (i % 5 === 0) await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+
     lastSyncAt = Date.now();
-    console.log(`[Sync] Bootstrap complete — ${ids.length} agents cached`);
+    console.log(`[Sync] Bootstrap complete — ${ids.length} agents, listings cached`);
   } catch (e) {
     console.error("[Sync] Bootstrap error:", e.message || e);
   }
@@ -342,8 +436,25 @@ async function startEventIndexer() {
   });
 
   if (commerce) {
+    commerce.on("ListingCreated", async (listingId, agentId, serviceType) => {
+      console.log("[Indexer] ListingCreated", String(listingId).slice(0, 14));
+      try { await pullListing(listingId); } catch {}
+      broadcast("ListingCreated", { listingId, agentId, serviceType: Number(serviceType), ts: Date.now() });
+    });
     commerce.on("OrderCreated", (orderId, listingId, buyerAgentId) => {
       broadcast("OrderCreated", { orderId, listingId, buyerAgentId, ts: Date.now() });
+    });
+  }
+
+  if (demoMarket) {
+    demoMarket.on("TradeExecuted", (agentId, operator, amountUSD, strategy, success) => {
+      const usd = Number(amountUSD) / 1e18;
+      console.log(`[Indexer] DemoTrade $${usd} ${strategy}`);
+      db.prepare(
+        `INSERT INTO transactions (agent_id,protocol,amount_usd,success,blocked,reasoning,timestamp,block_number) VALUES (?,?,?,?,0,?,?,0)`
+      ).run(agentId, process.env.DEMO_MARKET_ADDRESS, usd, success ? 1 : 0, `demo:${strategy}`, Date.now());
+      broadcast("DemoTrade", { agentId, operator, amountUSD: usd, strategy, success, ts: Date.now() });
+      _updateDailyStats({ volume: usd, txs: 1 });
     });
   }
 
@@ -408,6 +519,21 @@ app.get("/api/protocol", async (req, res) => {
       vault: process.env.VAULT_ADDRESS ?? null,
       commerce: process.env.COMMERCE_ADDRESS ?? null,
       executor: process.env.EXECUTOR_ADDRESS ?? null,
+      demoMarket: process.env.DEMO_MARKET_ADDRESS ?? null,
+    },
+    platform: {
+      railGatedTrading: true,
+      marketplace: !!commerce,
+      vault: !!process.env.VAULT_ADDRESS,
+      strategyPublish: true,
+      workflow: [
+        "1. Publish strategy (registerAgent + codeHash + manifest)",
+        "2. Audit → Active",
+        "3. Stake (optional)",
+        "4. Grant EXECUTOR_ROLE to bot wallet",
+        "5. Trade only via AgentExecutor.execute → DemoMarket/DeFi",
+        "6. List services on AgentCommerce",
+      ],
     },
     registrationFeeEth: fee,
     totalAgents: total,
@@ -751,7 +877,76 @@ app.get("/api/audits", (req, res) => {
 app.post("/api/sync", async (req, res) => {
   try {
     await bootstrapFromChain();
-    res.json({ ok: true, lastSyncAt, agents: db.prepare("SELECT COUNT(*) as c FROM agents").get().c });
+    res.json({
+      ok: true,
+      lastSyncAt,
+      agents: db.prepare("SELECT COUNT(*) as c FROM agents").get().c,
+      listings: db.prepare("SELECT COUNT(*) as c FROM listings").get().c,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.get("/api/marketplace/listings", (req, res) => {
+  try {
+    const rows = db
+      .prepare(
+        `SELECT l.*, a.name as agent_name, a.status as agent_status, a.strategy
+         FROM listings l LEFT JOIN agents a ON l.agent_id = a.id
+         WHERE l.active = 1 ORDER BY l.created_at DESC LIMIT 100`
+      )
+      .all();
+    const SERVICE = ["DataFeed", "Computation", "Arbitrage", "Strategy", "Monitoring", "Execution"];
+    res.json({
+      listings: rows.map((r) => ({
+        ...r,
+        serviceTypeLabel: SERVICE[r.service_type] ?? "Service",
+        priceEth: r.price_per_unit ? Number(r.price_per_unit) / 1e18 : 0,
+      })),
+      total: rows.length,
+      commerce: process.env.COMMERCE_ADDRESS,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.get("/api/strategies", (req, res) => {
+  try {
+    const rows = db
+      .prepare(
+        `SELECT id, name, owner, status, strategy, strategy_manifest, code_hash, capabilities, audit_score, reputation, total_volume_usd
+         FROM agents WHERE strategy_manifest IS NOT NULL OR strategy IS NOT NULL
+         ORDER BY registered_at DESC LIMIT 100`
+      )
+      .all();
+    res.json({
+      strategies: rows.map((r) => ({
+        ...r,
+        manifest: r.strategy_manifest ? JSON.parse(r.strategy_manifest) : null,
+      })),
+      total: rows.length,
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+app.get("/api/market/stats", async (req, res) => {
+  try {
+    let demoTrades = 0;
+    if (demoMarket) {
+      try { demoTrades = Number(await demoMarket.tradeCount()); } catch {}
+    }
+    const vol = db.prepare("SELECT SUM(amount_usd) as v FROM transactions WHERE success=1").get();
+    res.json({
+      demoMarket: process.env.DEMO_MARKET_ADDRESS ?? null,
+      demoTrades,
+      indexedVolumeUSD: vol.v ?? 0,
+      listings: db.prepare("SELECT COUNT(*) as c FROM listings WHERE active=1").get().c,
+      agents: db.prepare("SELECT COUNT(*) as c FROM agents").get().c,
+    });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }

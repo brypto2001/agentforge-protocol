@@ -885,6 +885,235 @@ function RailsLab({ agents }) {
   );
 }
 
+// ─── Marketplace ──────────────────────────────────────────────────────────────
+function Marketplace({ wallet }) {
+  const [listings, setListings] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [msg, setMsg] = useState(null);
+  const [form, setForm] = useState({
+    agentId: "", name: "", description: "", priceEth: "0.0001", serviceType: 3,
+  });
+
+  const load = useCallback(() => {
+    setLoading(true);
+    api.get("/api/marketplace/listings")
+      .then((r) => setListings(r.listings ?? []))
+      .catch(console.error)
+      .finally(() => setLoading(false));
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const COMMERCE_ABI_UI = [
+    "function createListing(bytes32 agentId,uint8 serviceType,string name,string description,address paymentToken,uint256 pricePerUnit,uint256 unitSize,uint256 minUnits,uint256 maxUnits,bytes32 slaHash) returns (bytes32)",
+  ];
+
+  async function createListing() {
+    const eth = getInjectedProvider();
+    if (!eth || !COMMERCE_ADDRESS) { setMsg("Connect wallet / commerce missing"); return; }
+    if (!form.agentId || !form.name) { setMsg("Agent ID + name required"); return; }
+    setMsg("Confirm in wallet…");
+    try {
+      const provider = new BrowserProvider(eth);
+      const signer = await provider.getSigner();
+      const c = new Contract(COMMERCE_ADDRESS, COMMERCE_ABI_UI, signer);
+      const tx = await c.createListing(
+        form.agentId,
+        form.serviceType,
+        form.name,
+        form.description || "AgentForge service",
+        "0x0000000000000000000000000000000000000000",
+        parseEther(form.priceEth || "0.0001"),
+        1n, 1n, 100n, ZeroHash,
+        { gasLimit: 600_000n }
+      );
+      setMsg(`Submitted ${tx.hash.slice(0, 12)}…`);
+      await tx.wait();
+      setMsg("Listing live on-chain");
+      load();
+      try { await api.post("/api/sync", {}); } catch {}
+    } catch (e) {
+      setMsg(e.shortMessage || e.message || String(e));
+    }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+      <div>
+        <h1 className="hero-title" style={{ margin: 0, fontSize: 26, fontWeight: 800, fontFamily: "'Space Grotesk',sans-serif" }}>
+          Agent <span className="shine-text">Marketplace</span>
+        </h1>
+        <p style={{ color: "#64748b", fontSize: 14, marginTop: 8, lineHeight: 1.5 }}>
+          Publish services from your registered agents. Listings are on-chain via AgentCommerce.
+        </p>
+      </div>
+
+      <div className="grid-2">
+        <div className="glass" style={{ borderRadius: 16, padding: 18 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", marginBottom: 12 }}>Create listing</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <input placeholder="Agent ID (0x…)" value={form.agentId} onChange={(e) => setForm((f) => ({ ...f, agentId: e.target.value.trim() }))} style={{ width: "100%" }} />
+            <input placeholder="Service name" value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} style={{ width: "100%" }} />
+            <textarea placeholder="Description" value={form.description} onChange={(e) => setForm((f) => ({ ...f, description: e.target.value }))} rows={3} style={{ width: "100%", resize: "vertical" }} />
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <select value={form.serviceType} onChange={(e) => setForm((f) => ({ ...f, serviceType: Number(e.target.value) }))} style={{ width: "100%" }}>
+                {["DataFeed", "Computation", "Arbitrage", "Strategy", "Monitoring", "Execution"].map((s, i) => (
+                  <option key={s} value={i}>{s}</option>
+                ))}
+              </select>
+              <input placeholder="Price ETH / unit" value={form.priceEth} onChange={(e) => setForm((f) => ({ ...f, priceEth: e.target.value }))} style={{ width: "100%" }} />
+            </div>
+            <button type="button" className="btn-primary" style={{ padding: 12, borderRadius: 12 }} onClick={createListing} disabled={!wallet.account}>
+              {wallet.account ? "Publish listing on-chain" : "Connect wallet first"}
+            </button>
+            {msg && <div style={{ fontSize: 12, color: "#94a3b8" }}>{msg}</div>}
+          </div>
+        </div>
+
+        <div className="glass" style={{ borderRadius: 16, padding: 18 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 12 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0" }}>Live listings</div>
+            <button type="button" className="btn-ghost" style={{ padding: "6px 10px", borderRadius: 8, fontSize: 11 }} onClick={load}>Refresh</button>
+          </div>
+          {loading ? <Spinner /> : listings.length === 0 ? (
+            <div style={{ color: "#64748b", fontSize: 13, textAlign: "center", padding: 24 }}>No listings yet — create one or wait for indexer sync.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, maxHeight: 420, overflowY: "auto" }}>
+              {listings.map((l) => (
+                <div key={l.id} className="glass" style={{ padding: 12, borderRadius: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                    <div style={{ fontWeight: 600, color: "#f1f5f9", fontSize: 13 }}>{l.name}</div>
+                    <Badge label={l.serviceTypeLabel || "Service"} color="#818cf8" />
+                  </div>
+                  <div style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>{l.description}</div>
+                  <div style={{ fontSize: 11, color: "#94a3b8", marginTop: 8, fontFamily: "monospace" }}>
+                    {l.agent_name || fmtAddr(l.agent_id)} · {l.priceEth} ETH/unit
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Publish strategy (custom code) ───────────────────────────────────────────
+function PublishStrategy({ wallet, onDone }) {
+  const [form, setForm] = useState({
+    name: "",
+    strategy: "custom",
+    capabilities: "custom,monitor",
+    maxSingle: 500,
+    maxDaily: 5000,
+    maxSlip: 100,
+    source: "// Your strategy logic\n// MUST call AgentExecutor.execute — never raw protocol txs\nasync function run(client, agentId) {\n  await client.tradeUnderRails({ agentId, marketAddress: DEMO_MARKET, amountUSD: 50, strategy: 'custom' });\n}\n",
+  });
+  const [busy, setBusy] = useState(false);
+  const [log, setLog] = useState([]);
+  const push = (m) => setLog((L) => [...L, m]);
+
+  async function publish() {
+    const eth = getInjectedProvider();
+    if (!eth || !REGISTRY_ADDRESS) {
+      push(isMobile() ? "Open in MetaMask app first" : "Connect wallet");
+      return;
+    }
+    if (!form.name.trim()) { push("Name required"); return; }
+    setBusy(true); setLog([]);
+    try {
+      await ensureChain(eth, TARGET_CHAIN_HEX, CHAIN_PARAMS);
+      const provider = new BrowserProvider(eth);
+      const signer = await provider.getSigner();
+      const registry = new Contract(REGISTRY_ADDRESS, REGISTRY_ABI, signer);
+      const fee = await registry.registrationFee();
+      const caps = form.capabilities.split(",").map((s) => s.trim()).filter(Boolean);
+      const codeHash = keccak256(toUtf8Bytes(form.source));
+      const modelHash = keccak256(toUtf8Bytes(form.name + ":model"));
+      const manifest = {
+        name: form.name,
+        version: "1.0.0",
+        strategy: form.strategy,
+        capabilities: caps,
+        codeHash,
+        sourcePreview: form.source.slice(0, 800),
+        rails: {
+          maxSingleTxUSD: form.maxSingle,
+          maxDailyVolumeUSD: form.maxDaily,
+          maxSlippageBps: form.maxSlip,
+        },
+        publishedAt: new Date().toISOString(),
+        compliant: "AgentExecutor.execute only",
+      };
+      const metadataURI =
+        "data:application/json;base64," +
+        btoa(unescape(encodeURIComponent(JSON.stringify(manifest))));
+      const rails = {
+        maxSingleTxUSD: parseEther(String(form.maxSingle)),
+        maxDailyVolumeUSD: parseEther(String(form.maxDaily)),
+        maxSlippageBps: form.maxSlip,
+        allowedProtocols: [],
+        allowedTokens: [],
+        requiresMultisig: false,
+        multisigThresholdUSD: parseEther(String(Math.floor(form.maxSingle / 2))),
+        cooldownPeriod: 0,
+      };
+      push("Registering strategy on-chain…");
+      const tx = await registry.registerAgent(
+        modelHash, codeHash, caps, 1, rails, metadataURI,
+        Math.floor(Date.now() / 1000) + 3600, "0x",
+        { value: fee, gasLimit: 3_000_000n }
+      );
+      push(`Tx ${tx.hash}`);
+      await tx.wait();
+      push("✅ Strategy published. Status: Pending — audit to activate.");
+      push("Then run: npm run agent:custom  OR autonomous-trader.ts");
+      onDone?.();
+      try { await api.post("/api/sync", {}); } catch {}
+    } catch (e) {
+      push("Error: " + (e.shortMessage || e.message || String(e)));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div>
+        <h1 className="hero-title" style={{ margin: 0, fontSize: 26, fontWeight: 800, fontFamily: "'Space Grotesk',sans-serif" }}>
+          Publish <span className="shine-text">Strategy</span>
+        </h1>
+        <p style={{ color: "#64748b", fontSize: 14, marginTop: 8, lineHeight: 1.5, maxWidth: 560 }}>
+          Upload strategy identity + source hash + rails. This is real on-chain registration with a codeHash — not a UI label.
+        </p>
+      </div>
+      <div className="grid-2">
+        <div className="glass" style={{ borderRadius: 16, padding: 18, display: "flex", flexDirection: "column", gap: 10 }}>
+          <input placeholder="Strategy name" value={form.name} onChange={(e) => setForm((f) => ({ ...f, name: e.target.value }))} style={{ width: "100%" }} />
+          <select value={form.strategy} onChange={(e) => setForm((f) => ({ ...f, strategy: e.target.value }))} style={{ width: "100%" }}>
+            {["yield", "arb", "oracle", "custom"].map((s) => <option key={s} value={s}>{s}</option>)}
+          </select>
+          <input placeholder="capabilities (comma-separated)" value={form.capabilities} onChange={(e) => setForm((f) => ({ ...f, capabilities: e.target.value }))} style={{ width: "100%" }} />
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+            <input type="number" value={form.maxSingle} onChange={(e) => setForm((f) => ({ ...f, maxSingle: Number(e.target.value) }))} title="Max single USD" style={{ width: "100%" }} />
+            <input type="number" value={form.maxDaily} onChange={(e) => setForm((f) => ({ ...f, maxDaily: Number(e.target.value) }))} title="Max daily USD" style={{ width: "100%" }} />
+            <input type="number" value={form.maxSlip} onChange={(e) => setForm((f) => ({ ...f, maxSlip: Number(e.target.value) }))} title="Max slip bps" style={{ width: "100%" }} />
+          </div>
+          <textarea value={form.source} onChange={(e) => setForm((f) => ({ ...f, source: e.target.value }))} rows={12}
+            style={{ width: "100%", fontFamily: "'JetBrains Mono',monospace", fontSize: 11, resize: "vertical" }} />
+          <button type="button" className="btn-primary" disabled={busy || !wallet.account} onClick={publish}
+            style={{ padding: 14, borderRadius: 12 }}>
+            {busy ? "Publishing…" : wallet.account ? "Publish strategy (0.01 ETH)" : "Connect wallet"}
+          </button>
+        </div>
+        <div className="glass" style={{ borderRadius: 16, padding: 18, fontFamily: "monospace", fontSize: 11, color: "#94a3b8", minHeight: 280, whiteSpace: "pre-wrap" }}>
+          {log.length === 0 ? "Publish log will appear here.\n\nWorkflow:\n1. Publish strategy\n2. Audit → Active\n3. Stake (optional)\n4. EXECUTOR_ROLE for bot\n5. Trade via AgentExecutor only\n6. List on Marketplace" : log.join("\n")}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Register modal ───────────────────────────────────────────────────────────
 function RegisterModal({ wallet, onClose, onSuccess }) {
   const [step, setStep] = useState(0);
@@ -1188,6 +1417,8 @@ export default function Dashboard() {
   const tabs = useMemo(() => [
     { id: "overview", label: "Overview", icon: "◈" },
     { id: "rails", label: "Rails Lab", icon: "⚡" },
+    { id: "publish", label: "Publish", icon: "✎" },
+    { id: "market", label: "Market", icon: "◫" },
     { id: "agents", label: `Agents (${liveAgents.length})`, icon: "⬡" },
     { id: "events", label: "Live Feed", icon: "▣" },
     { id: "audits", label: "Audits", icon: "◎" },
@@ -1498,6 +1729,14 @@ export default function Dashboard() {
 
         {/* RAILS LAB */}
         {activeTab === "rails" && <RailsLab agents={liveAgents} />}
+
+        {/* PUBLISH STRATEGY */}
+        {activeTab === "publish" && (
+          <PublishStrategy wallet={wallet} onDone={() => { refetchAgents(); refetchStats(); }} />
+        )}
+
+        {/* MARKETPLACE */}
+        {activeTab === "market" && <Marketplace wallet={wallet} />}
 
         {/* AGENTS */}
         {activeTab === "agents" && (

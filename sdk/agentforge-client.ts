@@ -248,20 +248,8 @@ export class AgentForgeClient {
       throw new Error("valid protocol address required");
     }
 
-    // Pre-check rails (optional but good UX)
-    const pre = await this.checkRails({
-      agentId: params.agentId,
-      protocol: params.protocol,
-      token: params.token,
-      amountUSD: Number(params.tokenAmount ?? 0n) > 0
-        ? Number(params.tokenAmount) / 1e6 // rough USDC; prefer explicit checkRails before execute
-        : 0,
-      slippageBps: params.slippageBps,
-    }).catch(() => null);
-
-    if (pre && !pre.allowed) {
-      throw new Error(`Rails would block: ${pre.reason}`);
-    }
+    // Rails are enforced on-chain inside AgentExecutor.execute → checkTx.
+    // Call checkRails() yourself for UX; do not double-guess USD scale here.
 
     const req = {
       agentId: params.agentId,
@@ -314,6 +302,58 @@ export class AgentForgeClient {
     const tx = await this.registry.submitAudit(agentId, score, ZeroHash, [], passed);
     const receipt = await tx.wait();
     return receipt.hash;
+  }
+
+  /**
+   * Rail-gated trade against DemoMarket (or any market with trade(agentId,amountUSD,strategy)).
+   * amountUSD is human dollars; encoded as 1e18 for rails + market.
+   */
+  async tradeUnderRails(params: {
+    agentId: string;
+    marketAddress: string;
+    amountUSD: number;
+    strategy: string;
+    slippageBps?: number;
+  }): Promise<{ success: boolean; txHash: string; blocked?: boolean; reason?: string }> {
+    const { Interface, parseEther: pe } = await import("ethers");
+    const amount = pe(String(params.amountUSD));
+    const pre = await this.checkRails({
+      agentId: params.agentId,
+      protocol: params.marketAddress,
+      token: params.marketAddress,
+      amountUSD: params.amountUSD,
+      slippageBps: params.slippageBps ?? 50,
+    });
+    if (!pre.allowed) {
+      return { success: false, txHash: "", blocked: true, reason: pre.reason };
+    }
+    const iface = new Interface([
+      "function trade(bytes32 agentId,uint256 amountUSD,string strategy) returns (bool)",
+    ]);
+    const callData = iface.encodeFunctionData("trade", [
+      params.agentId,
+      amount,
+      params.strategy,
+    ]);
+    const result = await this.execute({
+      agentId: params.agentId,
+      protocol: params.marketAddress,
+      token: params.marketAddress,
+      tokenAmount: amount,
+      callData,
+      slippageBps: params.slippageBps ?? 50,
+      reasoning: `tradeUnderRails:${params.strategy}`,
+    });
+    return { ...result, blocked: false };
+  }
+
+  /** Publish strategy as data:application/json metadata on register */
+  static encodeStrategyManifest(manifest: Record<string, unknown>): string {
+    const json = JSON.stringify(manifest);
+    if (typeof Buffer !== "undefined") {
+      return "data:application/json;base64," + Buffer.from(json).toString("base64");
+    }
+    return "data:application/json;base64," + btoa(json);
   }
 }
 

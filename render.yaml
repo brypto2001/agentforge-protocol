@@ -26,3 +26,7 @@ services:
         value: "0"
       - key: DASHBOARD_URL
         sync: false
+      - key: DEMO_MARKET_ADDRESS
+        sync: false
+      - key: CHAIN_ID
+        value: "84532"
