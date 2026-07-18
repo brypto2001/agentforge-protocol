@@ -162,15 +162,20 @@ contract AgentRegistryV2 is
         require(msg.value >= fee, "Insufficient registration fee");
         require(block.timestamp <= deadline, "Signature expired");
 
-        // Verify EIP-712 sig
-        bytes32 structHash = keccak256(abi.encode(
-            AGENT_REGISTRATION_TYPEHASH,
-            msg.sender, modelHash,
-            keccak256(abi.encode(capabilities)),
-            uint8(safetyLevel), nonces[msg.sender]++, deadline
-        ));
-        address signer = _hashTypedDataV4(structHash).recover(signature);
-        require(signer == msg.sender, "Invalid signature");
+        // Optional EIP-712 signature. Empty signature is allowed because
+        // msg.sender is already the owner (MetaMask / standard wallets often
+        // cannot reproduce the non-standard string[] hash used in v1).
+        if (signature.length == 65) {
+            bytes32 structHash = keccak256(abi.encode(
+                AGENT_REGISTRATION_TYPEHASH,
+                msg.sender, modelHash,
+                keccak256(abi.encode(capabilities)),
+                uint8(safetyLevel), nonces[msg.sender], deadline
+            ));
+            address signer = _hashTypedDataV4(structHash).recover(signature);
+            require(signer == msg.sender, "Invalid signature");
+        }
+        nonces[msg.sender]++;
 
         _validateRailsForSafetyLevel(rails, safetyLevel);
 

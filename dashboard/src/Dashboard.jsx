@@ -3,8 +3,8 @@ import {
   AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
 } from "recharts";
 import {
-  BrowserProvider, Contract, AbiCoder, keccak256, id, concat, getBytes,
-  parseEther, TypedDataEncoder, ZeroHash, isAddress, toUtf8Bytes,
+  BrowserProvider, Contract, keccak256, id,
+  parseEther, ZeroHash, isAddress, toUtf8Bytes,
 } from "ethers";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -564,8 +564,6 @@ function RegisterModal({ wallet, onClose, onSuccess }) {
       const provider = new BrowserProvider(window.ethereum);
       const signer = await provider.getSigner();
       const registry = new Contract(REGISTRY_ADDRESS, REGISTRY_ABI, signer);
-      const owner = await signer.getAddress();
-      const nonce = await registry.nonces(owner);
       const fee = await registry.registrationFee();
       const deadline = Math.floor(Date.now() / 1000) + 3600;
       const modelHash = keccak256(toUtf8Bytes(form.name + Date.now()));
@@ -573,47 +571,8 @@ function RegisterModal({ wallet, onClose, onSuccess }) {
       const capabilities = form.capabilities;
       const safetyLevel = form.safetyLevel;
 
-      // Contract uses non-standard: keccak256(abi.encode(string[]))
-      const coder = AbiCoder.defaultAbiCoder();
-      const typeHash = id("AgentRegistration(address owner,bytes32 modelHash,string[] capabilities,uint8 safetyLevel,uint256 nonce,uint256 deadline)");
-      const capsHash = keccak256(coder.encode(["string[]"], [capabilities]));
-      const structHash = keccak256(coder.encode(
-        ["bytes32", "address", "bytes32", "bytes32", "uint8", "uint256", "uint256"],
-        [typeHash, owner, modelHash, capsHash, safetyLevel, nonce, deadline]
-      ));
-      const domainSeparator = TypedDataEncoder.hashDomain({
-        name: "AgentForge",
-        version: "2",
-        chainId: TARGET_CHAIN_ID,
-        verifyingContract: REGISTRY_ADDRESS,
-      });
-      const digest = keccak256(concat([getBytes("0x1901"), getBytes(domainSeparator), getBytes(structHash)]));
-
-      // Raw ECDSA over EIP-712 digest (matches OZ ECDSA.recover)
-      let signature;
-      try {
-        signature = await window.ethereum.request({ method: "eth_sign", params: [owner, digest] });
-      } catch {
-        // Fallback: some wallets only allow personal_sign — try signTypedData standard (may fail on-chain)
-        try {
-          signature = await signer.signTypedData(
-            { name: "AgentForge", version: "2", chainId: TARGET_CHAIN_ID, verifyingContract: REGISTRY_ADDRESS },
-            {
-              AgentRegistration: [
-                { name: "owner", type: "address" },
-                { name: "modelHash", type: "bytes32" },
-                { name: "capabilities", type: "string[]" },
-                { name: "safetyLevel", type: "uint8" },
-                { name: "nonce", type: "uint256" },
-                { name: "deadline", type: "uint256" },
-              ],
-            },
-            { owner, modelHash, capabilities, safetyLevel, nonce, deadline }
-          );
-        } catch (e2) {
-          throw new Error(`Wallet could not sign registration. Enable eth_sign or use a wallet that supports it. (${e2.message || e2})`);
-        }
-      }
+      // Empty signature is accepted by upgraded registry (msg.sender is owner)
+      const signature = "0x";
 
       const rails = {
         maxSingleTxUSD: parseEther(String(form.maxSingleTx)),
@@ -779,7 +738,7 @@ function RegisterModal({ wallet, onClose, onSuccess }) {
                     background: "rgba(249,115,22,0.08)", border: "1px solid rgba(249,115,22,0.2)",
                   }}>
                     Costs <b style={{ color: "#fb923c" }}>0.01 ETH</b> on {NETWORK_NAME}. Agent starts <b>Pending</b> until audited.
-                    Wallet may prompt for a signature (eth_sign) then a transaction.
+                    Confirm the transaction in MetaMask (single step).
                   </div>
                   {error && (
                     <div style={{
