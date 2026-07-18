@@ -1,0 +1,180 @@
+version: "3.9"
+
+services:
+  # ── Backend Server ────────────────────────────────────────────────────────────
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    container_name: agentforge-server
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      - BASE_RPC_URL=${BASE_RPC_URL}
+      - REGISTRY_ADDRESS=${REGISTRY_ADDRESS}
+      - COMMERCE_ADDRESS=${COMMERCE_ADDRESS}
+      - VAULT_ADDRESS=${VAULT_ADDRESS}
+      - EXECUTOR_ADDRESS=${EXECUTOR_ADDRESS}
+      - DEPLOY_BLOCK=${DEPLOY_BLOCK:-0}
+      - DB_PATH=/data/agentforge.db
+      - DASHBOARD_URL=${DASHBOARD_URL:-*}
+    volumes:
+      - server-data:/data
+    ports:
+      - "4000:4000"
+    networks:
+      - agentforge
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # ── Yield Optimizer Agent ─────────────────────────────────────────────────────
+  agent-yield:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.agent
+    container_name: agentforge-yield
+    restart: unless-stopped
+    environment:
+      - AGENT_TYPE=yield
+      - PRIVATE_KEY=${YIELD_AGENT_PRIVATE_KEY}
+      - BASE_RPC_URL=${BASE_RPC_URL}
+      - REGISTRY_ADDRESS=${REGISTRY_ADDRESS}
+      - COMMERCE_ADDRESS=${COMMERCE_ADDRESS}
+      - VAULT_ADDRESS=${VAULT_ADDRESS}
+      - EXECUTOR_ADDRESS=${EXECUTOR_ADDRESS}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-claude-opus-4-6}
+      - POSITION_USDC=${YIELD_POSITION_USDC:-1000}
+      - LOOP_INTERVAL_MS=${LOOP_INTERVAL_MS:-300000}
+      - MEV_PROTECTION=true
+      - DB_PATH=/data/yield-agent.db
+      - METRICS_PORT=9091
+    volumes:
+      - yield-data:/data
+    ports:
+      - "9091:9091"
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - agentforge
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9091/metrics"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Arbitrage Agent ───────────────────────────────────────────────────────────
+  agent-arb:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.agent
+    container_name: agentforge-arb
+    restart: unless-stopped
+    environment:
+      - AGENT_TYPE=arbitrage
+      - PRIVATE_KEY=${ARB_AGENT_PRIVATE_KEY}
+      - BASE_RPC_URL=${BASE_RPC_URL}
+      - REGISTRY_ADDRESS=${REGISTRY_ADDRESS}
+      - COMMERCE_ADDRESS=${COMMERCE_ADDRESS}
+      - VAULT_ADDRESS=${VAULT_ADDRESS}
+      - EXECUTOR_ADDRESS=${EXECUTOR_ADDRESS}
+      - MIN_PROFIT_USD=${ARB_MIN_PROFIT_USD:-5}
+      - LOOP_INTERVAL_MS=30000
+      - MEV_PROTECTION=true
+      - DB_PATH=/data/arb-agent.db
+      - METRICS_PORT=9092
+    volumes:
+      - arb-data:/data
+    ports:
+      - "9092:9092"
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - agentforge
+
+  # ── Data Oracle Agent ─────────────────────────────────────────────────────────
+  agent-oracle:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.agent
+    container_name: agentforge-oracle
+    restart: unless-stopped
+    environment:
+      - AGENT_TYPE=oracle
+      - PRIVATE_KEY=${ORACLE_AGENT_PRIVATE_KEY}
+      - BASE_RPC_URL=${BASE_RPC_URL}
+      - REGISTRY_ADDRESS=${REGISTRY_ADDRESS}
+      - STORAGE_CONTRACT=${ORACLE_STORAGE_CONTRACT:-0x0000000000000000000000000000000000000000}
+      - LOOP_INTERVAL_MS=60000
+      - DB_PATH=/data/oracle-agent.db
+      - METRICS_PORT=9093
+    volumes:
+      - oracle-data:/data
+    ports:
+      - "9093:9093"
+    depends_on:
+      server:
+        condition: service_healthy
+    networks:
+      - agentforge
+
+  # ── Prometheus ────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.50.0
+    container_name: agentforge-prometheus
+    restart: unless-stopped
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - agentforge
+
+  # ── Grafana ───────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.3.0
+    container_name: agentforge-grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-agentforge123}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_INSTALL_PLUGINS=grafana-clock-panel
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - agentforge
+
+volumes:
+  server-data:
+  yield-data:
+  arb-data:
+  oracle-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  agentforge:
+    driver: bridge

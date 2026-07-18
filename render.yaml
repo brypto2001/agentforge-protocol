@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: agentforge-server
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm install --legacy-peer-deps
+    startCommand: npx ts-node --transpile-only server/server.ts
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "20"
+      - key: BASE_RPC_URL
+        sync: false
+      - key: REGISTRY_ADDRESS
+        sync: false
+      - key: COMMERCE_ADDRESS
+        sync: false
+      - key: VAULT_ADDRESS
+        sync: false
+      - key: EXECUTOR_ADDRESS
+        sync: false
+      - key: DEPLOY_BLOCK
+        value: "0"
+      - key: DASHBOARD_URL
+        sync: false

@@ -1,0 +1,162 @@
+"""
+AgentForge Subgraph Schema
+Indexes all protocol events for instant historical queries.
+"""
+
+type Agent @entity {
+  id: ID!                        # agentId (bytes32 as hex)
+  owner: Bytes!                  # owner address
+  modelHash: Bytes!
+  codeHash: Bytes!
+  capabilities: [String!]!
+  safetyLevel: Int!              # 0=Minimal, 1=Standard, 2=Strict, 3=Paranoid
+  status: Int!                   # 0=Pending, 1=Active, 2=Suspended, 3=Deprecated
+  registeredAt: BigInt!
+  lastAuditAt: BigInt
+  auditScore: BigInt!
+  auditor: Bytes
+  totalTxCount: BigInt!
+  totalVolumeUSD: BigDecimal!
+  reputationScore: BigInt!
+  kycVerified: Boolean!
+  chain: String!
+  metadataURI: String
+  executor: Bytes
+
+  # Relations
+  safetyRails: SafetyRails
+  auditRecords: [AuditRecord!]! @derivedFrom(field: "agent")
+  transactions: [AgentTransaction!]! @derivedFrom(field: "agent")
+  statusHistory: [StatusChange!]! @derivedFrom(field: "agent")
+  listings: [ServiceListing!]! @derivedFrom(field: "agent")
+  orders: [ServiceOrder!]! @derivedFrom(field: "buyerAgent")
+}
+
+type SafetyRails @entity {
+  id: ID!                        # agentId
+  agent: Agent!
+  maxSingleTxUSD: BigDecimal!
+  maxDailyVolumeUSD: BigDecimal!
+  maxSlippageBps: Int!
+  allowedProtocols: [Bytes!]!
+  allowedTokens: [Bytes!]!
+  requiresMultisig: Boolean!
+  multisigThresholdUSD: BigDecimal!
+  cooldownPeriod: BigInt!
+  updatedAt: BigInt!
+}
+
+type AuditRecord @entity {
+  id: ID!                        # txHash-logIndex
+  agent: Agent!
+  auditor: Bytes!
+  score: Int!
+  passed: Boolean!
+  reportHash: Bytes!
+  findings: [String!]!
+  timestamp: BigInt!
+  blockNumber: BigInt!
+  transactionHash: Bytes!
+}
+
+type AgentTransaction @entity {
+  id: ID!                        # txHash-logIndex
+  agent: Agent!
+  protocol: Bytes!
+  amountUSD: BigDecimal!
+  success: Boolean!
+  blocked: Boolean!
+  blockReason: String
+  gasUsed: BigInt
+  timestamp: BigInt!
+  blockNumber: BigInt!
+  transactionHash: Bytes!
+  dayId: String!                 # YYYY-MM-DD for daily aggregation
+}
+
+type StatusChange @entity {
+  id: ID!
+  agent: Agent!
+  oldStatus: Int!
+  newStatus: Int!
+  timestamp: BigInt!
+  transactionHash: Bytes!
+}
+
+type ServiceListing @entity {
+  id: ID!                        # listingId
+  agent: Agent!
+  serviceType: Int!
+  name: String!
+  description: String!
+  paymentToken: Bytes!
+  pricePerUnit: BigDecimal!
+  unitSize: BigInt!
+  minUnits: BigInt!
+  maxUnits: BigInt!
+  totalEarned: BigDecimal!
+  totalOrders: BigInt!
+  active: Boolean!
+  createdAt: BigInt!
+  slaHash: Bytes!
+
+  orders: [ServiceOrder!]! @derivedFrom(field: "listing")
+}
+
+type ServiceOrder @entity {
+  id: ID!                        # orderId
+  listing: ServiceListing!
+  buyerAgent: Agent!
+  sellerAgentId: Bytes!
+  units: BigInt!
+  totalPrice: BigDecimal!
+  paymentToken: Bytes!
+  status: Int!                   # 0=Open, 1=Filled, 2=Cancelled, 3=Disputed, 4=Resolved
+  createdAt: BigInt!
+  deliveredAt: BigInt
+  deliveryProofHash: Bytes
+  escrowAmount: BigDecimal!
+  buyerConfirmed: Boolean!
+  disputeReason: String
+}
+
+# Daily aggregate stats — one entity per day
+type DailyProtocolStats @entity {
+  id: ID!                        # YYYY-MM-DD
+  date: String!
+  totalAgentsActive: Int!
+  totalTransactions: Int!
+  totalVolumeUSD: BigDecimal!
+  totalBlockedTxs: Int!
+  blockRate: BigDecimal!
+  totalCommerceVolume: BigDecimal!
+  totalOrders: Int!
+  newAgentsRegistered: Int!
+  auditsCompleted: Int!
+  avgAuditScore: BigDecimal!
+}
+
+# Per-agent daily stats
+type AgentDailyStats @entity {
+  id: ID!                        # agentId-YYYY-MM-DD
+  agent: Agent!
+  date: String!
+  txCount: Int!
+  volumeUSD: BigDecimal!
+  blockedCount: Int!
+  reputationEnd: BigInt!
+  gasSpentWei: BigInt!
+}
+
+# Protocol-wide totals
+type ProtocolStats @entity {
+  id: ID!                        # "global"
+  totalAgents: Int!
+  activeAgents: Int!
+  totalVolumeUSD: BigDecimal!
+  totalTransactions: BigInt!
+  totalAudits: Int!
+  totalCommerceVolume: BigDecimal!
+  totalStakedUSD: BigDecimal!
+  updatedAt: BigInt!
+}
