@@ -40,6 +40,16 @@ const api = {
     if (!r.ok) throw new Error(`API ${path} failed: ${r.status}`);
     return r.json();
   },
+  post: async (path, body) => {
+    const r = await fetch(`${API_URL}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body ?? {}),
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || `API ${path} failed: ${r.status}`);
+    return data;
+  },
 };
 
 // ─── Hooks ────────────────────────────────────────────────────────────────────
@@ -538,6 +548,255 @@ function AgentDetail({ agentId, wallet, onAudited }) {
   );
 }
 
+// ─── Rails Lab (legendary product surface) ────────────────────────────────────
+function RailsLab({ agents }) {
+  const active = agents.filter((a) => a.status === 1);
+  const any = agents[0];
+  const [mode, setMode] = useState("simulate"); // simulate | chain
+  const [agentId, setAgentId] = useState(active[0]?.id || any?.id || "");
+  const [amountUSD, setAmount] = useState(5000);
+  const [slippageBps, setSlip] = useState(80);
+  const [maxSingle, setMaxSingle] = useState(10000);
+  const [maxDaily, setMaxDaily] = useState(100000);
+  const [maxSlip, setMaxSlip] = useState(100);
+  const [status, setStatus] = useState(1);
+  const [dailyUsed, setDailyUsed] = useState(0);
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    if (!agentId && agents[0]?.id) setAgentId(agents[0].id);
+  }, [agents, agentId]);
+
+  async function runCheck() {
+    setLoading(true); setError(null); setResult(null);
+    try {
+      if (mode === "chain") {
+        if (!agentId) throw new Error("Select an on-chain agent");
+        const data = await api.post("/api/rails/check", {
+          agentId,
+          amountUSD,
+          slippageBps,
+          protocol: "0x0000000000000000000000000000000000000000",
+          token: "0x0000000000000000000000000000000000000000",
+        });
+        setResult(data);
+      } else {
+        const data = await api.post("/api/rails/simulate", {
+          status,
+          maxSingleTxUSD: maxSingle,
+          maxDailyVolumeUSD: maxDaily,
+          maxSlippageBps: maxSlip,
+          amountUSD,
+          slippageBps,
+          dailyUsedUSD: dailyUsed,
+        });
+        setResult(data);
+      }
+    } catch (e) {
+      setError(e.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div>
+        <h1 style={{ margin: 0, fontSize: 28, fontWeight: 800, fontFamily: "'Space Grotesk',sans-serif", letterSpacing: "-0.03em" }}>
+          Rails <span className="shine-text">Lab</span>
+        </h1>
+        <p style={{ margin: "8px 0 0", color: "#64748b", fontSize: 14, maxWidth: 640, lineHeight: 1.55 }}>
+          This is the product. Before an agent moves capital, every intent hits the rails.
+          Simulate policy offline — or call <code style={{ color: "#a5b4fc" }}>checkTx</code> on-chain for absolute truth.
+        </p>
+      </div>
+
+      <div style={{ display: "flex", gap: 8 }}>
+        {[
+          { id: "simulate", label: "Policy simulator" },
+          { id: "chain", label: "On-chain checkTx" },
+        ].map((m) => (
+          <button key={m.id} type="button" onClick={() => { setMode(m.id); setResult(null); }}
+            className={mode === m.id ? "btn-primary" : "btn-ghost"}
+            style={{ padding: "9px 16px", borderRadius: 10, fontSize: 12 }}>
+            {m.label}
+          </button>
+        ))}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1.1fr 0.9fr", gap: 16 }}>
+        <div className="glass" style={{ borderRadius: 18, padding: 22 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: "#94a3b8", marginBottom: 16, letterSpacing: "0.06em", textTransform: "uppercase" }}>
+            Intent
+          </div>
+
+          {mode === "chain" && (
+            <div style={{ marginBottom: 14 }}>
+              <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 6 }}>Agent</label>
+              <select value={agentId} onChange={(e) => setAgentId(e.target.value)} style={{ width: "100%" }}>
+                {agents.length === 0 && <option value="">No agents indexed yet</option>}
+                {agents.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.name || a.id.slice(0, 12)} · {STATUS_LABEL[a.status] ?? "?"}
+                  </option>
+                ))}
+              </select>
+              <div style={{ fontSize: 10, color: "#475569", marginTop: 6, fontFamily: "monospace" }}>{agentId}</div>
+            </div>
+          )}
+
+          {mode === "simulate" && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
+              <div>
+                <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 6 }}>Agent status</label>
+                <select value={status} onChange={(e) => setStatus(Number(e.target.value))} style={{ width: "100%" }}>
+                  <option value={0}>Pending</option>
+                  <option value={1}>Active</option>
+                  <option value={2}>Suspended</option>
+                </select>
+              </div>
+              <div>
+                <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 6 }}>Daily used (USD)</label>
+                <input type="number" value={dailyUsed} onChange={(e) => setDailyUsed(Number(e.target.value))} style={{ width: "100%" }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 6 }}>Max single TX</label>
+                <input type="number" value={maxSingle} onChange={(e) => setMaxSingle(Number(e.target.value))} style={{ width: "100%" }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 6 }}>Max daily volume</label>
+                <input type="number" value={maxDaily} onChange={(e) => setMaxDaily(Number(e.target.value))} style={{ width: "100%" }} />
+              </div>
+              <div>
+                <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 6 }}>Max slippage (bps)</label>
+                <input type="number" value={maxSlip} onChange={(e) => setMaxSlip(Number(e.target.value))} style={{ width: "100%" }} />
+              </div>
+            </div>
+          )}
+
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div>
+              <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 6 }}>Proposed amount (USD)</label>
+              <input type="number" value={amountUSD} onChange={(e) => setAmount(Number(e.target.value))} style={{ width: "100%" }} />
+            </div>
+            <div>
+              <label style={{ fontSize: 11, color: "#94a3b8", display: "block", marginBottom: 6 }}>Proposed slippage (bps)</label>
+              <input type="number" value={slippageBps} onChange={(e) => setSlip(Number(e.target.value))} style={{ width: "100%" }} />
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 8, marginTop: 18, flexWrap: "wrap" }}>
+            {[
+              { label: "Safe $1k", a: 1000, s: 30 },
+              { label: "Edge $9.9k", a: 9900, s: 90 },
+              { label: "Breach $50k", a: 50000, s: 50 },
+              { label: "Slip 5%", a: 2000, s: 500 },
+            ].map((p) => (
+              <button key={p.label} type="button" className="btn-ghost" style={{ padding: "7px 12px", borderRadius: 8, fontSize: 11 }}
+                onClick={() => { setAmount(p.a); setSlip(p.s); }}>
+                {p.label}
+              </button>
+            ))}
+          </div>
+
+          <button type="button" className="btn-primary" disabled={loading}
+            onClick={runCheck}
+            style={{ width: "100%", marginTop: 18, padding: "13px 0", borderRadius: 12, fontSize: 14 }}>
+            {loading ? "Checking…" : mode === "chain" ? "Run on-chain checkTx" : "Simulate rails"}
+          </button>
+          {error && (
+            <div style={{ marginTop: 12, padding: 12, borderRadius: 10, background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.25)", color: "#fca5a5", fontSize: 12 }}>
+              {error}
+            </div>
+          )}
+        </div>
+
+        <div className="glass" style={{
+          borderRadius: 18, padding: 22, minHeight: 320,
+          border: result
+            ? `1px solid ${result.allowed ? "rgba(16,185,129,0.4)" : "rgba(239,68,68,0.4)"}`
+            : "1px solid rgba(255,255,255,0.08)",
+          background: result
+            ? result.allowed
+              ? "linear-gradient(160deg,rgba(16,185,129,0.12),rgba(255,255,255,0.02))"
+              : "linear-gradient(160deg,rgba(239,68,68,0.12),rgba(255,255,255,0.02))"
+            : undefined,
+        }}>
+          {!result && !loading && (
+            <div style={{ height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", color: "#64748b", textAlign: "center", padding: 20 }}>
+              <div style={{ fontSize: 40, marginBottom: 12, animation: "float 3s ease-in-out infinite" }}>⬡</div>
+              <div style={{ fontSize: 15, fontWeight: 600, color: "#94a3b8" }}>Verdict appears here</div>
+              <div style={{ fontSize: 12, marginTop: 8, maxWidth: 260, lineHeight: 1.5 }}>
+                Legendary systems don&apos;t hope agents behave. They prove what is allowed.
+              </div>
+            </div>
+          )}
+          {loading && <div style={{ padding: 60 }}><Spinner size={32} /></div>}
+          {result && (
+            <div>
+              <div style={{
+                fontSize: 42, fontWeight: 800, letterSpacing: "0.08em",
+                fontFamily: "'Space Grotesk',sans-serif",
+                color: result.allowed ? "#34d399" : "#f87171",
+                textShadow: result.allowed ? "0 0 40px rgba(52,211,153,0.4)" : "0 0 40px rgba(248,113,113,0.35)",
+              }}>
+                {result.verdict || (result.allowed ? "ALLOW" : "BLOCK")}
+              </div>
+              <div style={{ fontSize: 14, color: "#e2e8f0", marginTop: 8, fontWeight: 500 }}>{result.reason}</div>
+              <div style={{ fontSize: 11, color: "#64748b", marginTop: 6 }}>
+                mode: {result.mode || mode} · {new Date(result.ts || Date.now()).toLocaleTimeString()}
+              </div>
+
+              {result.agent && (
+                <div className="glass" style={{ marginTop: 16, padding: 12, borderRadius: 12, fontSize: 12, color: "#94a3b8" }}>
+                  Agent <b style={{ color: "#e2e8f0" }}>{result.agent.name}</b> · {result.agent.statusLabel}
+                </div>
+              )}
+
+              {result.checks && (
+                <div style={{ marginTop: 18, display: "flex", flexDirection: "column", gap: 8 }}>
+                  {result.checks.map((c, i) => (
+                    <div key={i} style={{
+                      display: "flex", justifyContent: "space-between", gap: 10, padding: "10px 12px", borderRadius: 10,
+                      background: "rgba(0,0,0,0.25)", border: `1px solid ${c.pass ? "rgba(16,185,129,0.2)" : "rgba(239,68,68,0.25)"}`,
+                    }}>
+                      <span style={{ fontSize: 12, color: c.pass ? "#34d399" : "#f87171", fontWeight: 600 }}>
+                        {c.pass ? "✓" : "✕"} {c.rule}
+                      </span>
+                      <span style={{ fontSize: 11, color: "#64748b", fontFamily: "monospace", textAlign: "right" }}>{c.detail}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {mode === "chain" && result.input && (
+                <div style={{ marginTop: 16, fontSize: 11, color: "#475569", fontFamily: "monospace", lineHeight: 1.6 }}>
+                  amount=${result.input.amountUSD} · slip={result.input.slippageBps}bps
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 12 }}>
+        {[
+          { t: "Identity first", d: "No anonymous capital. Every intent maps to an agent ID and owner." },
+          { t: "Rails before alpha", d: "Yield is optional. Blow-up protection is not. Limits are on-chain." },
+          { t: "Block is a feature", d: "A blocked tx is success — the protocol refused chaos." },
+        ].map((x) => (
+          <div key={x.t} className="glass" style={{ borderRadius: 14, padding: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: "#e2e8f0", marginBottom: 6 }}>{x.t}</div>
+            <div style={{ fontSize: 12, color: "#64748b", lineHeight: 1.5 }}>{x.d}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ─── Register modal ───────────────────────────────────────────────────────────
 function RegisterModal({ wallet, onClose, onSuccess }) {
   const [step, setStep] = useState(0);
@@ -835,11 +1094,12 @@ export default function Dashboard() {
 
   const tabs = useMemo(() => [
     { id: "overview", label: "Overview", icon: "◈" },
+    { id: "rails", label: "Rails Lab", icon: "⚡" },
     { id: "agents", label: `Agents (${liveAgents.length})`, icon: "⬡" },
     { id: "events", label: "Live Feed", icon: "▣" },
     { id: "audits", label: "Audits", icon: "◎" },
     { id: "analytics", label: "Analytics", icon: "◆" },
-    { id: "contracts", label: "Contracts", icon: "◎" },
+    { id: "contracts", label: "Protocol", icon: "◎" },
   ], [liveAgents.length]);
 
   const contracts = [
@@ -1061,6 +1321,9 @@ export default function Dashboard() {
           </div>
         )}
 
+        {/* RAILS LAB */}
+        {activeTab === "rails" && <RailsLab agents={liveAgents} />}
+
         {/* AGENTS */}
         {activeTab === "agents" && (
           <div style={{ display: "flex", gap: 16 }}>
@@ -1241,40 +1504,66 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* CONTRACTS */}
+        {/* PROTOCOL */}
         {activeTab === "contracts" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
             <div>
-              <h2 style={{ margin: 0, fontSize: 22, fontWeight: 700, fontFamily: "'Space Grotesk',sans-serif" }}>Deployed Contracts</h2>
-              <p style={{ color: "#64748b", fontSize: 13, marginTop: 6 }}>{NETWORK_NAME} · chainId {TARGET_CHAIN_ID}</p>
+              <h1 style={{ margin: 0, fontSize: 28, fontWeight: 800, fontFamily: "'Space Grotesk',sans-serif", letterSpacing: "-0.03em" }}>
+                The <span className="shine-text">Protocol</span>
+              </h1>
+              <p style={{ color: "#94a3b8", fontSize: 15, marginTop: 10, maxWidth: 640, lineHeight: 1.6 }}>
+                Agents will move capital without humans in the loop. Without identity, limits, and auditability, that is chaos.
+                AgentForge makes every agent accountable on-chain.
+              </p>
             </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(300px,1fr))", gap: 14 }}>
-              {contracts.map((c) => (
-                <div key={c.name} className="glass glass-hover" style={{ borderRadius: 16, padding: 20 }}>
-                  <div style={{ fontSize: 15, fontWeight: 700, color: "#e2e8f0", marginBottom: 4 }}>{c.name}</div>
-                  <div style={{ fontSize: 12, color: "#64748b", marginBottom: 12 }}>{c.desc}</div>
-                  <div style={{
-                    fontSize: 11, fontFamily: "'JetBrains Mono',monospace", color: "#a5b4fc",
-                    wordBreak: "break-all", padding: "10px 12px", borderRadius: 10,
-                    background: "rgba(0,0,0,0.35)", border: "1px solid rgba(255,255,255,0.06)",
-                  }}>
-                    {c.address || "Not configured"}
-                  </div>
-                  {c.address && isAddress(c.address) && (
-                    <a href={`${EXPLORER}/address/${c.address}`} target="_blank" rel="noreferrer"
-                      style={{ display: "inline-block", marginTop: 12, fontSize: 12, color: "#818cf8", textDecoration: "none" }}>
-                      Open on BaseScan ↗
-                    </a>
-                  )}
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
+              {[
+                { t: "Identity", d: "Permanent agent ID, owner, model hash, capabilities." },
+                { t: "Rails", d: "Max tx, daily volume, slippage, cooldowns — enforced." },
+                { t: "Audit", d: "Scores, reputation, suspend on failure." },
+                { t: "Execution", d: "Executor is the choke point. No pass, no tx." },
+              ].map((p) => (
+                <div key={p.t} className="glass glass-hover" style={{ borderRadius: 16, padding: 18 }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: "#e2e8f0", marginBottom: 8 }}>{p.t}</div>
+                  <div style={{ fontSize: 12, color: "#64748b", lineHeight: 1.5 }}>{p.d}</div>
                 </div>
               ))}
             </div>
-            <div className="glass" style={{ borderRadius: 16, padding: 18, fontSize: 13, color: "#94a3b8", lineHeight: 1.6 }}>
-              <b style={{ color: "#e2e8f0" }}>What&apos;s live:</b> 4 contracts on Base Sepolia · backend indexer on Render · this dashboard on Vercel.
-              <br />
-              <b style={{ color: "#e2e8f0" }}>What&apos;s empty:</b> No agents registered yet, so stats/charts stay zero until you register + audit.
-              <br />
-              <b style={{ color: "#e2e8f0" }}>Deployer note:</b> Your deploy wallet already has AUDITOR_ROLE from contract initialize.
+
+            <div>
+              <h2 style={{ margin: "8px 0 14px", fontSize: 16, fontWeight: 700, color: "#94a3b8" }}>
+                Deployed on {NETWORK_NAME} · chainId {TARGET_CHAIN_ID}
+              </h2>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill,minmax(300px,1fr))", gap: 14 }}>
+                {contracts.map((c) => (
+                  <div key={c.name} className="glass glass-hover" style={{ borderRadius: 16, padding: 20 }}>
+                    <div style={{ fontSize: 15, fontWeight: 700, color: "#e2e8f0", marginBottom: 4 }}>{c.name}</div>
+                    <div style={{ fontSize: 12, color: "#64748b", marginBottom: 12 }}>{c.desc}</div>
+                    <div style={{
+                      fontSize: 11, fontFamily: "'JetBrains Mono',monospace", color: "#a5b4fc",
+                      wordBreak: "break-all", padding: "10px 12px", borderRadius: 10,
+                      background: "rgba(0,0,0,0.35)", border: "1px solid rgba(255,255,255,0.06)",
+                    }}>
+                      {c.address || "Not configured"}
+                    </div>
+                    {c.address && isAddress(c.address) && (
+                      <a href={`${EXPLORER}/address/${c.address}`} target="_blank" rel="noreferrer"
+                        style={{ display: "inline-block", marginTop: 12, fontSize: 12, color: "#818cf8", textDecoration: "none" }}>
+                        Open on BaseScan ↗
+                      </a>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="glass" style={{ borderRadius: 16, padding: 18, fontSize: 13, color: "#94a3b8", lineHeight: 1.7 }}>
+              <b style={{ color: "#e2e8f0" }}>How to feel the product in 60 seconds:</b>
+              <br />1. Open <b style={{ color: "#c4b5fd" }}>Rails Lab</b> → run “Breach $50k” → see BLOCK.
+              <br />2. Register an agent → approve audit → status Active.
+              <br />3. Rails Lab → On-chain checkTx → try a size above its rails → BLOCK from the contract.
+              <br />4. Live Feed shows identity, audit, and enforcement as first-class events.
             </div>
           </div>
         )}
